@@ -24,14 +24,17 @@
 
 # SQLite to PostgreSQL Migration Script for Core Lightning
 # Migrates Core Lightning SQLite database to PostgreSQL with pgloader
-# Supports all Core Lightning database versions
-# Schema is automatically created by pgloader from SQLite structure
 #
-# PostgreSQL migration handled by pgloader with automatic type conversion
+# Tested against Core Lightning v26.06.10 (schema version 284).
+# The target schema is created from CLN's own PostgreSQL DDL
+# (schema/cln_v26.06.10_schema.sql, dumped from a working lightningd
+# postgres wallet) so that tables, sequences, indexes and constraints
+# match what lightningd expects; pgloader then copies data only.
 
 set -euo pipefail
 
 # Global variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQLITE_FILE=""
 PG_DB_NAME=""
 PG_USER=""
@@ -41,6 +44,9 @@ PG_HOST=""
 PG_PORT=""
 USE_SOCKET=false
 SOCKET_PATH="/var/run/postgresql"
+SCHEMA_FILE="$SCRIPT_DIR/schema/cln_v26.06.10_schema.sql"
+SQLITE_WORK_FILE=""
+MIGRATION_TMPDIR=""
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -76,18 +82,21 @@ Required arguments:
 
 Optional arguments:
   -u, --user USER           PostgreSQL lightning application user (default: lightning)
+  -a, --apppass PASS        Password for the application user (will prompt if not provided)
   -s, --superuser USER      PostgreSQL superuser for database creation (default: postgres)
   -S, --superpass PASS      PostgreSQL superuser password (will prompt if not provided)
   -h, --host HOST           PostgreSQL host (default: localhost)
   -P, --port PORT           PostgreSQL port (default: 5432)
   --socket PATH             Use UNIX socket instead of TCP (default: /var/run/postgresql)
+  --schema FILE             CLN PostgreSQL schema to create before loading data
+                            (default: schema/cln_v26.06.10_schema.sql next to this script)
   --help                    Show this help message
 
 Examples:
   $0 ~/.lightning/lightningd.sqlite3 lightningd
   $0 /path/to/db.sqlite3 lightningd -u lightning_user -s postgres -S super_pass
   $0 db.sqlite3 lightningd --superuser admin --superpass admin123
-  $0 db.sqlite3 lightningd --socket /tmp/.s.PGSQL.5432
+  $0 db.sqlite3 lightningd --socket /var/run/postgresql -a app_pass
 
 EOF
 }
@@ -123,6 +132,10 @@ parse_arguments() {
                 PG_USER="$2"
                 shift 2
                 ;;
+            -a|--apppass)
+                LIGHTNING_PASSWORD="$2"
+                shift 2
+                ;;
             -s|--superuser)
                 PG_SUPERUSER="$2"
                 shift 2
@@ -142,6 +155,10 @@ parse_arguments() {
             --socket)
                 USE_SOCKET=true
                 SOCKET_PATH="$2"
+                shift 2
+                ;;
+            --schema)
+                SCHEMA_FILE="$2"
                 shift 2
                 ;;
             *)
@@ -169,6 +186,17 @@ parse_arguments() {
         exit 1
     fi
 
+    # Normalize to an absolute path so the pgloader sqlite:// URI is valid
+    SQLITE_FILE="$(readlink -f "$SQLITE_FILE")"
+
+    # Check if the CLN PostgreSQL schema file exists
+    if [[ ! -f "$SCHEMA_FILE" ]]; then
+        log_error "PostgreSQL schema file not found: $SCHEMA_FILE"
+        log_error "Provide one with --schema, or regenerate it from a running"
+        log_error "lightningd postgres wallet: pg_dump --schema-only --no-owner --no-privileges"
+        exit 1
+    fi
+
     # Prompt for superuser password if not provided
     if [[ "$USE_SOCKET" == false && -z "$PG_SUPERUSER_PASSWORD" ]]; then
         read -s -p "Enter PostgreSQL password for superuser '$PG_SUPERUSER': " PG_SUPERUSER_PASSWORD
@@ -177,6 +205,7 @@ parse_arguments() {
 
     log_info "Configuration:"
     log_info "  SQLite file: $SQLITE_FILE"
+    log_info "  Schema file: $SCHEMA_FILE"
     log_info "  PostgreSQL database: $PG_DB_NAME"
     log_info "  Application user: $PG_USER"
     log_info "  Superuser: $PG_SUPERUSER"
@@ -215,11 +244,16 @@ setup_password_env() {
 prompt_lightning_password() {
     local password1=""
     local password2=""
-    
+
+    # Skip the prompt when a password was already provided via --apppass
+    if [[ -n "$LIGHTNING_PASSWORD" ]]; then
+        return 0
+    fi
+
     echo
     log_info "Application user '$PG_USER' will be created/used for the database."
     log_info "Please set a password for this user:"
-    
+
     while true; do
         read -s -p "Enter password for application user '$PG_USER': " password1
         echo
@@ -297,7 +331,8 @@ validate_sqlite_database() {
     fi
     
     log_info "Current schema version: $schema_version"
-    log_info "Note: This migration script supports all Core Lightning database versions"
+    log_info "Note: The bundled PostgreSQL schema matches CLN v26.06.10 (db version 284)."
+    log_info "      For other versions, dump a fresh schema with --schema (see --help)."
     
     # Get list of tables for verification later
     log_info "Enumerating tables in SQLite database..."
@@ -409,7 +444,7 @@ build_pgloader_from_source() {
             else
                 log_warn "pgloader installed but may not be working properly"
             fi
-            cd /home/ingo/code/lightning
+            cd - >/dev/null
             rm -rf "$build_dir"
             return 0
         else
@@ -478,17 +513,16 @@ install_pgloader() {
         log_error "No supported package manager found"
         log_info "Attempting to build pgloader from source..."
         if build_pgloader_from_source; then
-                log_success "pgloader built and installed successfully from source"
-                return 0
-            else
-                log_error "Please install pgloader manually:"
-                log_error "  Ubuntu/Debian: sudo apt-get install pgloader"
-                log_error "  CentOS/RHEL: Use yum.postgresql.org repository"
-                log_error "  Arch Linux: yay -S pgloader (AUR)"
-                log_error "  macOS: brew install pgloader"
-                log_error "  Build from source: https://pgloader.readthedocs.io/en/latest/install.html"
-                return 1
-            fi
+            log_success "pgloader built and installed successfully from source"
+            return 0
+        else
+            log_error "Please install pgloader manually:"
+            log_error "  Ubuntu/Debian: sudo apt-get install pgloader"
+            log_error "  CentOS/RHEL: Use yum.postgresql.org repository"
+            log_error "  Arch Linux: yay -S pgloader (AUR)"
+            log_error "  macOS: brew install pgloader"
+            log_error "  Build from source: https://pgloader.readthedocs.io/en/latest/install.html"
+            return 1
         fi
     fi
 }
@@ -514,10 +548,10 @@ setup_postgresql_database() {
     
     if [[ -n "$db_exists" ]]; then
         log_warn "Database '$pg_db_name' already exists"
-        read -p "Do you want to drop and recreate it? This will delete all data. (y/N): " confirm
+        read -p "Do you want to drop and recreate it? This will delete all data. (y/N): " confirm || confirm=""
         if [[ "$confirm" =~ ^[yY]$ ]]; then
             log_info "Dropping existing database..."
-            if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "DROP DATABASE IF EXISTS $pg_db_name;"; then
+            if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "DROP DATABASE IF EXISTS \"$pg_db_name\";"; then
                 log_error "Failed to drop existing database"
                 return 1
             fi
@@ -526,10 +560,10 @@ setup_postgresql_database() {
             return 0
         fi
     fi
-    
+
     # Create database with superuser
     log_info "Creating database '$pg_db_name' with superuser '$PG_SUPERUSER'..."
-    if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "CREATE DATABASE $pg_db_name;"; then
+    if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "CREATE DATABASE \"$pg_db_name\";"; then
         log_error "Failed to create database"
         return 1
     fi
@@ -579,7 +613,7 @@ create_application_user() {
     fi
     
     log_info "Granting database '$pg_db_name' ownership to application user '$pg_user'..."
-    if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "ALTER DATABASE $pg_db_name OWNER TO $pg_user;" >/dev/null 2>&1; then
+    if ! psql $conn_params -U "$PG_SUPERUSER" -d postgres -c "ALTER DATABASE \"$pg_db_name\" OWNER TO \"$pg_user\";" >/dev/null 2>&1; then
         log_error "Failed to grant database ownership"
         return 1
     fi
@@ -595,9 +629,15 @@ create_application_user() {
         log_error "Failed to grant table permissions"
         return 1
     fi
-    
-    # Grant permissions on all future tables
-    if ! psql $conn_params -U "$PG_SUPERUSER" -d "$pg_db_name" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $pg_user;" >/dev/null 2>&1; then
+
+    log_info "Granting sequence permissions to application user '$pg_user'..."
+    if ! psql $conn_params -U "$PG_SUPERUSER" -d "$pg_db_name" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $pg_user;" >/dev/null 2>&1; then
+        log_error "Failed to grant sequence permissions"
+        return 1
+    fi
+
+    # Grant permissions on all future tables and sequences
+    if ! psql $conn_params -U "$PG_SUPERUSER" -d "$pg_db_name" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $pg_user; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $pg_user;" >/dev/null 2>&1; then
         log_warn "Could not set default privileges (continuing)"
     fi
     
@@ -633,6 +673,165 @@ verify_database_exists() {
     return 0
 }
 
+# Function to create the CLN schema from the bundled PostgreSQL DDL dump
+apply_cln_schema() {
+    local pg_host="$1"
+    local pg_port="$2"
+    local pg_db_name="$3"
+    local use_socket="$4"
+    local socket_path="$5"
+
+    log_info "Creating CLN schema from $SCHEMA_FILE ..."
+
+    local conn_params
+    conn_params=$(setup_connection_params "$pg_host" "$pg_port" "$use_socket" "$socket_path")
+
+    if ! psql $conn_params -U "$PG_SUPERUSER" -d "$pg_db_name" -v ON_ERROR_STOP=1 -f "$SCHEMA_FILE"; then
+        log_error "Failed to apply CLN schema"
+        return 1
+    fi
+
+    log_success "CLN schema created"
+    return 0
+}
+
+# Function to reset all column-owned sequences to MAX(col)+1 after data load.
+# pgloader's 'reset sequences' option does not fire in data-only mode, so
+# this step is required for subsequent inserts (channel/invoice/payment ids).
+reset_sequences() {
+    local pg_host="$1"
+    local pg_port="$2"
+    local pg_db_name="$3"
+    local use_socket="$4"
+    local socket_path="$5"
+
+    log_info "Resetting sequences to match migrated data..."
+
+    local conn_params
+    conn_params=$(setup_connection_params "$pg_host" "$pg_port" "$use_socket" "$socket_path")
+
+    psql $conn_params -U "$PG_SUPERUSER" -d "$pg_db_name" -v ON_ERROR_STOP=1 <<'EOSQL'
+DO $$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN
+        SELECT s.relname AS seq, t.relname AS tbl, a.attname AS col
+        FROM pg_class s
+        JOIN pg_depend d ON d.objid = s.oid AND d.deptype = 'a'
+        JOIN pg_class t ON t.oid = d.refobjid
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+        JOIN pg_namespace n ON n.oid = s.relnamespace
+        WHERE s.relkind = 'S' AND n.nspname = 'public'
+    LOOP
+        EXECUTE format(
+            'SELECT setval(%L, COALESCE((SELECT MAX(%I) FROM public.%I), 0) + 1, false)',
+            r.seq, r.col, r.tbl);
+    END LOOP;
+END $$;
+EOSQL
+
+    log_success "Sequences reset"
+    return 0
+}
+
+# Function to create a working copy of the SQLite file with out-of-fixnum
+# integer values rewritten as TEXT.
+#
+# CLN stores unsigned 64-bit values (scid aliases, group ids) as signed
+# int64 in SQLite INTEGER columns. Values beyond SBCL's fixnum range
+# (+-2^62) crash pgloader's integer-string transform and the whole row —
+# in practice the whole table — is lost. Cells cannot simply be UPDATEd
+# to text because INTEGER column affinity converts them straight back,
+# so affected tables are rebuilt with those columns declared TEXT. The
+# stored values then arrive at pgloader as strings; its transform parses
+# them as bignums and emits decimal strings that PostgreSQL bigint
+# accepts with identical signed values.
+# Helper: check whether the bundled pg schema defines column $2 on table $1
+pg_schema_has_column() {
+    awk -v start="CREATE TABLE public.$1 (" -v col="$2" '
+        index($0, start) == 1 {inside=1; next}
+        inside && /^\);/ {inside=0}
+        inside && ($1 == col || $1 == "\"" col "\"") {found=1; exit}
+        END {exit !found}' "$SCHEMA_FILE"
+}
+
+prepare_sqlite_workfile() {
+    local sqlite_file="$1"
+    local work_dir="$2"
+
+    local fixnum_max=4611686018427387903
+    local fixnum_min=-4611686018427387904
+
+    # VACUUM INTO produces a consistent copy without writing to the source
+    # and also repairs freelist/index inconsistencies typically found in
+    # backups copied from a live node (writes into a corrupted freelist
+    # would fail with "database disk image is malformed").
+    if ! sqlite3 "$sqlite_file" "VACUUM INTO '$work_dir/source.sqlite3';"; then
+        log_warn "VACUUM INTO failed (read-only source?), copying then vacuuming..."
+        cp --reflink=auto -- "$sqlite_file" "$work_dir/source.sqlite3"
+        sqlite3 "$work_dir/source.sqlite3" "VACUUM;"
+    fi
+    SQLITE_WORK_FILE="$work_dir/source.sqlite3"
+
+    local tables
+    tables=$(sqlite3 "$SQLITE_WORK_FILE" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+
+    local table col ctype affected needs_rowid count def select_list colspec
+    local rebuild_tables=()
+    while IFS= read -r table; do
+        [[ -z "$table" ]] && continue
+        def=""
+        select_list=""
+        affected=false
+        needs_rowid=false
+        # Tables where the implicit SQLite rowid must be materialized because
+        # the postgres schema carries an explicit "rowid" column (forwards).
+        if ! sqlite3 "$SQLITE_WORK_FILE" \
+            "SELECT 1 FROM pragma_table_info(\"$table\") WHERE name='rowid' LIMIT 1;" | grep -q 1 \
+            && pg_schema_has_column "$table" rowid; then
+            needs_rowid=true
+        fi
+        while IFS='|' read -r col ctype; do
+            [[ -z "$col" ]] && continue
+            count=0
+            if [[ "${ctype^^}" == *INT* ]]; then
+                count=$(sqlite3 "$SQLITE_WORK_FILE" \
+                    "SELECT COUNT(*) FROM \"$table\" WHERE \"$col\" > $fixnum_max OR \"$col\" < $fixnum_min;")
+            fi
+            if [[ "$count" -gt 0 ]]; then
+                affected=true
+                log_warn "Rebuilding '$table' with $col as TEXT ($count out-of-range value(s), pgloader bignum workaround)"
+                def+="\"$col\" TEXT, "
+                select_list+="CAST(\"$col\" AS TEXT) AS \"$col\", "
+            else
+                def+="\"$col\"${ctype:+ $ctype}, "
+                select_list+="\"$col\", "
+            fi
+        done < <(sqlite3 "$SQLITE_WORK_FILE" \
+            "SELECT name, type FROM pragma_table_info(\"$table\") ORDER BY cid;")
+        if [[ "$needs_rowid" == true ]]; then
+            log_warn "Rebuilding '$table' materializing implicit rowid (pgloader workaround)"
+            def+="\"rowid\" INTEGER, "
+            select_list+="rowid AS \"rowid\", "
+        fi
+        if [[ "$affected" == true || "$needs_rowid" == true ]]; then
+            rebuild_tables+=("$table")
+            sqlite3 "$SQLITE_WORK_FILE" "
+                CREATE TABLE \"${table}__clnmig\" (${def%, });
+                INSERT INTO \"${table}__clnmig\" SELECT ${select_list%, } FROM \"$table\";
+                DROP TABLE \"$table\";
+                ALTER TABLE \"${table}__clnmig\" RENAME TO \"$table\";
+            "
+        fi
+    done <<< "$tables"
+
+    if [[ ${#rebuild_tables[@]} -gt 0 ]]; then
+        log_info "Prepared working copy (rebuilt tables: ${rebuild_tables[*]}): $SQLITE_WORK_FILE"
+    fi
+    return 0
+}
+
 # Function to migrate data using pgloader (data-only)
 migrate_data() {
     local sqlite_file="$1"
@@ -645,13 +844,14 @@ migrate_data() {
     
     log_info "Starting data migration from SQLite to PostgreSQL..."
     
-    # Build connection string using superuser credentials
+    # Build connection string using superuser credentials.
+    # pgloader unix-socket URIs use unix:/socket/dir:port/dbname syntax.
     local pg_conn_string
     if [[ "$use_socket" == true ]]; then
         if [[ -n "$PG_SUPERUSER_PASSWORD" ]]; then
-            pg_conn_string="postgresql://$PG_SUPERUSER:$PG_SUPERUSER_PASSWORD@/$pg_db_name?host=$socket_path"
+            pg_conn_string="postgresql://$PG_SUPERUSER:$PG_SUPERUSER_PASSWORD@unix:$socket_path:$pg_port/$pg_db_name"
         else
-            pg_conn_string="postgresql://$PG_SUPERUSER@$pg_host:$pg_port/$pg_db_name"
+            pg_conn_string="postgresql://$PG_SUPERUSER@unix:$socket_path:$pg_port/$pg_db_name"
         fi
     else
         if [[ -n "$PG_SUPERUSER_PASSWORD" ]]; then
@@ -660,23 +860,23 @@ migrate_data() {
             pg_conn_string="postgresql://$PG_SUPERUSER@$pg_host:$pg_port/$pg_db_name"
         fi
     fi
-    
+
     log_info "Running pgloader locally for direct SQLite to PostgreSQL migration..."
-    
-    # Create pgloader configuration file for data migration
+
+    # Create pgloader configuration file for data migration.
+    # 'data only' — tables/sequences/indexes already exist (created from the
+    # CLN-native schema); 'disable triggers' disables FK triggers while data
+    # is copied so table load order cannot violate foreign keys.
     local config_file="/tmp/pgloader_config_$$.load"
-    
+
     cat > "$config_file" << EOF
 LOAD DATABASE
     FROM sqlite://$sqlite_file
     INTO $pg_conn_string
-WITH 
-    include drop, create tables, create indexes, reset sequences,
-    prefetch rows = 1000
-
-CAST type integer to bigint drop typemod,
-     type text to varchar drop typemod,
-     type blob to bytea
+WITH
+    data only, disable triggers,
+    batch rows = 20000, prefetch rows = 20000,
+    workers = 4, concurrency = 2
 ;
 EOF
     
@@ -731,15 +931,35 @@ main() {
         exit 1
     fi
     
-    # Verify database exists for pgloader (schema creation handled by pgloader)
+    # Verify database exists for pgloader (schema is applied separately)
     if ! verify_database_exists "$PG_HOST" "$PG_PORT" "$PG_USER" "$PG_DB_NAME" "$USE_SOCKET" "$SOCKET_PATH"; then
         log_error "Database verification failed"
         exit 1
     fi
-    
+
+    # Create the CLN schema (tables, sequences, indexes, constraints)
+    if ! apply_cln_schema "$PG_HOST" "$PG_PORT" "$PG_DB_NAME" "$USE_SOCKET" "$SOCKET_PATH"; then
+        log_error "Schema creation failed"
+        exit 1
+    fi
+
+    # Prepare a working copy of the SQLite file (pgloader bignum workaround)
+    MIGRATION_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/cln-migration.XXXXXX")
+    trap 'rm -rf "$MIGRATION_TMPDIR"' EXIT
+    if ! prepare_sqlite_workfile "$SQLITE_FILE" "$MIGRATION_TMPDIR"; then
+        log_error "Failed to prepare SQLite working copy"
+        exit 1
+    fi
+
     # Migrate data
-    if ! migrate_data "$SQLITE_FILE" "$PG_HOST" "$PG_PORT" "$PG_USER" "$PG_DB_NAME" "$USE_SOCKET" "$SOCKET_PATH"; then
+    if ! migrate_data "$SQLITE_WORK_FILE" "$PG_HOST" "$PG_PORT" "$PG_USER" "$PG_DB_NAME" "$USE_SOCKET" "$SOCKET_PATH"; then
         log_error "Data migration failed"
+        exit 1
+    fi
+
+    # Reset serial sequences so new rows get fresh ids
+    if ! reset_sequences "$PG_HOST" "$PG_PORT" "$PG_DB_NAME" "$USE_SOCKET" "$SOCKET_PATH"; then
+        log_error "Sequence reset failed"
         exit 1
     fi
     
